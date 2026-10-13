@@ -46,6 +46,11 @@ jobs:
   sync-and-validate:
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
     env:
       UPSTREAM_REPO: ${{ inputs.upstream_repo }}
       UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
