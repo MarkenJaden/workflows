@@ -1,0 +1,169 @@
+name: Reusable Upstream Sync & Validate
+
+on:
+  workflow_call:
+    inputs:
+      upstream_repo:
+        description: 'Upstream repository (owner/repo)'
+        required: true
+        type: string
+      upstream_branch:
+        description: 'Upstream branch to sync from'
+        required: false
+        type: string
+        default: 'main'
+      target_branch:
+        description: 'Target branch to update in this repo'
+        required: false
+        type: string
+        default: 'main'
+      python_version:
+        description: 'Python version to set up'
+        required: false
+        type: string
+        default: '3.12'
+      preflight_command:
+        description: 'Optional shell command to execute for preflight/syntax checks after merge'
+        required: false
+        type: string
+        default: ''
+      test_command:
+        description: 'Optional shell command to execute test suite after merge'
+        required: false
+        type: string
+        default: ''
+      post_merge_workflow:
+        description: 'Optional name of a workflow in the calling repository to trigger after pushing (e.g. docker-publish.yml)'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      GEMINI_API_KEY:
+        description: 'Google Gemini API key for automated merge conflict resolution'
+        required: false
+
+jobs:
+  sync-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+      UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+      TARGET_BRANCH: ${{ inputs.target_branch }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.target_branch }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Checkout Workflow Toolkit
+        uses: actions/checkout@v4
+        with:
+          repository: 'MarkenJaden/workflows'
+          path: '${{ runner.temp }}/workflow-tools'
+
+      - name: Fetch upstream
+        run: |
+          echo "Fetching from upstream https://github.com/${UPSTREAM_REPO}.git (${UPSTREAM_BRANCH})..."
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - name: Check for upstream changes
+        id: check_changes
+        run: |
+          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/${UPSTREAM_BRANCH})
+          echo "Commits behind upstream: ${BEHIND_COUNT}"
+          if [ "${BEHIND_COUNT}" -eq 0 ]; then
+            echo "Already up to date with upstream."
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Attempt merge
+        id: attempt_merge
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          echo "Attempting merge of upstream/${UPSTREAM_BRANCH} into ${TARGET_BRANCH}..."
+          if git merge --no-edit upstream/${UPSTREAM_BRANCH}; then
+            echo "merge_status=clean" >> $GITHUB_OUTPUT
+          else
+            echo "Merge conflict detected!"
+            echo "merge_status=conflict" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Auto-resolve conflicts with Gemini
+        id: gemini_resolve
+        if: steps.attempt_merge.outputs.merge_status == 'conflict'
+        run: |
+          if [ -z "${GEMINI_API_KEY}" ]; then
+            echo "No GEMINI_API_KEY configured. Skipping AI conflict resolution."
+            echo "resolve_status=skipped" >> $GITHUB_OUTPUT
+          else
+            echo "Attempting automated conflict resolution with Gemini..."
+            if python3 "${{ runner.temp }}/workflow-tools/scripts/gemini_conflict_resolver.py"; then
+              echo "Gemini successfully resolved all merge conflicts!"
+              echo "resolve_status=success" >> $GITHUB_OUTPUT
+            else
+              echo "Gemini could not resolve all conflicts cleanly."
+              echo "resolve_status=failed" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Handle unresolved merge conflict
+        if: steps.attempt_merge.outputs.merge_status == 'conflict' && steps.gemini_resolve.outputs.resolve_status != 'success'
+        run: |
+          echo "Aborting in-progress merge..."
+          git merge --abort || true
+          BRANCH_NAME="upstream-sync/conflict-${{ github.run_id }}"
+          echo "Creating sync branch ${BRANCH_NAME} from upstream..."
+          git checkout -B "${BRANCH_NAME}" "upstream/${UPSTREAM_BRANCH}"
+          git push origin "${BRANCH_NAME}" --force
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --title "⚠️ Upstream Sync Conflict - Manual Resolution Required" \
+            --body "Automated sync from \`${UPSTREAM_REPO}:${UPSTREAM_BRANCH}\` into \`${TARGET_BRANCH}\` encountered merge conflicts. Gemini auto-resolution was either unavailable or could not resolve all conflicts cleanly. Please inspect and resolve conflicts manually on branch \`${BRANCH_NAME}\`." \
+            --base "${TARGET_BRANCH}" \
+            --head "${BRANCH_NAME}" || \
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "⚠️ Upstream Sync Conflict" \
+            --body "Merge conflict occurred when syncing from \`${UPSTREAM_REPO}:${UPSTREAM_BRANCH}\`. Check branch \`${BRANCH_NAME}\`." || \
+          echo "::warning::Could not create PR/Issue via GitHub CLI."
+          exit 1
+
+      - name: Run preflight checks
+        if: (steps.attempt_merge.outputs.merge_status == 'clean' || steps.gemini_resolve.outputs.resolve_status == 'success') && inputs.preflight_command != ''
+        run: |
+          echo "Running configured preflight checks..."
+          ${{ inputs.preflight_command }}
+
+      - name: Run test suite
+        if: (steps.attempt_merge.outputs.merge_status == 'clean' || steps.gemini_resolve.outputs.resolve_status == 'success') && inputs.test_command != ''
+        run: |
+          echo "Running configured test suite..."
+          ${{ inputs.test_command }}
+
+      - name: Push merged changes to target branch
+        if: steps.attempt_merge.outputs.merge_status == 'clean' || steps.gemini_resolve.outputs.resolve_status == 'success'
+        run: |
+          echo "All validation checks passed! Pushing to ${TARGET_BRANCH}..."
+          git push origin "${TARGET_BRANCH}"
+          if [ -n "${{ inputs.post_merge_workflow }}" ]; then
+            echo "Triggering post-merge workflow ${{ inputs.post_merge_workflow }}..."
+            gh workflow run "${{ inputs.post_merge_workflow }}" --repo "${{ github.repository }}" --ref "${TARGET_BRANCH}" || true
+          fi
