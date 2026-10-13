@@ -75,11 +75,9 @@ jobs:
         with:
           python-version: ${{ inputs.python_version }}
 
-      - name: Checkout Workflow Toolkit
-        uses: actions/checkout@v4
-        with:
-          repository: 'MarkenJaden/workflows'
-          path: '${{ runner.temp }}/workflow-tools'
+      - name: Fetch Workflow Toolkit
+        run: |
+          git clone --depth=1 https://github.com/MarkenJaden/workflows.git /tmp/workflow-tools
 
       - name: Fetch upstream
         run: |
@@ -120,7 +118,7 @@ jobs:
             echo "resolve_status=skipped" >> $GITHUB_OUTPUT
           else
             echo "Attempting automated conflict resolution with Gemini..."
-            if python3 "${{ runner.temp }}/workflow-tools/scripts/gemini_conflict_resolver.py"; then
+            if python3 /tmp/workflow-tools/scripts/gemini_conflict_resolver.py; then
               echo "Gemini successfully resolved all merge conflicts!"
               echo "resolve_status=success" >> $GITHUB_OUTPUT
             else
