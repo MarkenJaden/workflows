@@ -305,14 +305,19 @@ def load_fork_divergences() -> str:
     return ""
 
 
+def _stage_path(file_path: str) -> None:
+    # -f is required when resolving conflicts in tracked files that live under .gitignore paths (e.g. build artifacts).
+    run_git(["add", "-f", "--", file_path])
+
+
 def _stage_ours(file_path: str) -> None:
     run_git(["checkout", "--ours", "--", file_path])
-    run_git(["add", "--", file_path])
+    _stage_path(file_path)
 
 
 def _stage_theirs(file_path: str) -> None:
     run_git(["checkout", "--theirs", "--", file_path])
-    run_git(["add", "--", file_path])
+    _stage_path(file_path)
 
 
 def _remove_path(file_path: str) -> None:
@@ -333,7 +338,7 @@ def resolve_tree_or_binary_conflict(file_path: str, status_xy: str, has_custom: 
         # Upstream deleted, fork kept/modified
         if has_custom:
             print(f"Fork customized {file_path} while upstream deleted it; preserving fork version.")
-            run_git(["add", "--", file_path])
+            _stage_path(file_path)
         else:
             print(f"Upstream deleted unmodified {file_path}; accepting deletion.")
             _remove_path(file_path)
@@ -488,7 +493,7 @@ def resolve_file(file_path: str, status_xy: str, api_key: str, merge_base: str, 
 
     if not has_conflict_markers(normalized):
         print(f"No conflict markers found in {file_path} (likely mode/index conflict); staging current file.")
-        run_git(["add", "--", file_path])
+        _stage_path(file_path)
         return True
 
     divergences_text = load_fork_divergences()
@@ -518,7 +523,7 @@ def resolve_file(file_path: str, status_xy: str, api_key: str, merge_base: str, 
 
         final_text = resolved_norm.replace("\n", "\r\n") if uses_crlf else resolved_norm
         p.write_text(final_text, encoding="utf-8", newline="")
-        run_git(["add", "--", file_path])
+        _stage_path(file_path)
         print(f"Successfully resolved, validated, and staged {file_path}")
         return True
     except Exception as exc:
@@ -562,7 +567,12 @@ def main() -> None:
 
     for f, xy in sorted(unmerged.items()):
         has_custom = file_has_custom_fork_commits(f, merge_base)
-        handled = resolve_tree_or_binary_conflict(f, xy, has_custom)
+        try:
+            handled = resolve_tree_or_binary_conflict(f, xy, has_custom)
+        except Exception as exc:
+            print(f"Failed deterministic resolution for {f} ({xy}): {exc}")
+            failed_files.append(f)
+            continue
         if handled is True:
             resolved_files.append(f)
             continue

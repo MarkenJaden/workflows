@@ -206,6 +206,47 @@ class TestGitRepoIntegration(unittest.TestCase):
             self.assertEqual((repo / "custom.py").read_text(encoding="utf-8"), "X = 10\nY = 20\n")
             self.assertIn(f"Upstream-Sync-Commit: {up_sha}", self._git(repo, "log", "-1", "--format=%B").stdout)
 
+    def test_gitignored_tracked_binary_and_text_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self._init_repo(repo)
+            (repo / ".gitignore").write_text("obj/\n", encoding="utf-8")
+            (repo / "obj").mkdir()
+            (repo / "obj" / "fw.bin").write_bytes(b"\x00\x01base")
+            (repo / "obj" / "version.h").write_text('const char *v = "base";\n', encoding="utf-8")
+            self._git(repo, "add", ".gitignore")
+            self._git(repo, "add", "-f", "obj/fw.bin", "obj/version.h")
+            self._git(repo, "commit", "-m", "base")
+
+            self._git(repo, "checkout", "-b", "upstream_branch")
+            (repo / "obj" / "fw.bin").write_bytes(b"\x00\x02upstream")
+            (repo / "obj" / "version.h").write_text('const char *v = "upstream";\n', encoding="utf-8")
+            self._git(repo, "add", "-u")
+            self._git(repo, "commit", "-m", "upstream build artifacts")
+
+            self._git(repo, "checkout", "Dom")
+            (repo / "obj" / "fw.bin").write_bytes(b"\x00\x03fork")
+            (repo / "obj" / "version.h").write_text('const char *v = "fork";\n', encoding="utf-8")
+            self._git(repo, "add", "-u")
+            self._git(repo, "commit", "-m", "feat: fork build artifacts")
+
+            res = self._git(repo, "merge", "--no-edit", "upstream_branch", check=False)
+            self.assertNotEqual(res.returncode, 0)
+
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(repo)
+                base_sha = self._git(repo, "merge-base", "HEAD", "MERGE_HEAD").stdout.strip()
+                with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key", "UPSTREAM_BASE": base_sha}):
+                    with mock.patch.object(gcr, "call_gemini", return_value='const char *v = "fork";\n'):
+                        gcr.main()
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual((repo / "obj" / "fw.bin").read_bytes(), b"\x00\x03fork")
+            self.assertEqual((repo / "obj" / "version.h").read_text(encoding="utf-8"), 'const char *v = "fork";\n')
+            self.assertEqual(gcr.get_conflicted_files(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
